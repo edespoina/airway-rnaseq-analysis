@@ -1,0 +1,664 @@
+---
+title: "RNA-seq Analysis: Dexamethasone Treatment in Airway Cells"
+author: "Despoina Eleftheriadou"
+date: "2026-06-14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    fig_width: 9
+    fig_height: 6
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+In this analysis/exercise, we analyse an RNA-seq experiment where human airway smooth muscle cells were treated with **dexamethasone** (a glucocorticoid steroid used to treat asthma) or left untreated.
+
+The goal is to find genes that change their expression in response to the drug.
+
+The data comes from the **"airway"** Bioconductor package (Himes et al. 2014, PLoS ONE).
+It contains read counts for ~64000 genes across 8 samples (4 treated, 4 untreated).
+
+---
+
+# Part 1: The Data
+
+## Install and load packages
+
+```{r install, eval=FALSE, include=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager", repos = "https://cran.r-project.org")
+
+BiocManager::install("airway")
+BiocManager::install("DESeq2")
+BiocManager::install("clusterProfiler")
+BiocManager::install("org.Hs.eg.db")
+
+install.packages(c("tidyverse", "pheatmap", "ggrepel"),
+                 repos = "https://cran.r-project.org")
+```
+
+```{r load-packages}
+library(airway)
+library(tidyverse)
+library(ggrepel)
+library(DESeq2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+```
+
+## Load the dataset
+
+```{r load-data}
+data("airway")
+airway
+```
+
+*What is this object?* 
+
+`airway` is a **`RangedSummarizedExperiment`**.
+
+It is a standard container in **Bioconductor** that stores the **count matrix** (how many reads mapped to each gene in each sample), **sample information** (which sample is treated, which cell line, etc.) and **gene coordinates** (where each gene sits on the genome) together.
+
+## **Sample information** (metadata)
+
+`airway` contains information about the samples.
+
+It captures the experimental design: which sample belongs to which condition.
+
+We can extract the table that describes each sample with **`colData`**.
+`colData` stands for column data — because each column of the count matrix is one sample, and this function retrieves the table that describes those columns.
+
+```{r metadata}
+design <- as.data.frame(colData(airway))
+design
+```
+
+We can see how many and which samples are treated and which are untreated:
+
+```{r condition-counts}
+treated <- design %>% filter(dex == "trt") %>% dplyr::select(dex)
+treated
+
+# how many treated (percentage)
+nrow(treated) / nrow(design) * 100
+
+untreated <- design %>% filter(dex == "untrt") %>% dplyr::select(dex)
+untreated
+
+# how many untreated (percentage)
+nrow(untreated) / nrow(design) * 100
+```
+
+## The **count matrix**
+
+`assay()` is a function from the SummarizedExperiment package.
+It extracts the numerical data stored inside a SummarizedExperiment object.
+The reason it exists is that a SummarizedExperiment can store multiple matrices for the same experiment — for example:
+
+- "counts" — the raw read counts
+- "normCounts" — normalised counts
+- "logCounts" — log-transformed counts
+
+Check what matrices are available in an object with:
+
+```{r assay-names}
+assayNames(airway)
+```
+
+**`assay(airway, "counts")`** means: "from the `airway` object, give me specifically the matrix called `counts`"
+
+```{r extract-counts}
+counts_raw <- assay(airway, "counts")
+
+head(counts_raw)
+dim(counts_raw)
+```
+
+There are `r nrow(counts_raw)` transcripts and `r ncol(counts_raw)` samples.
+In the `counts_raw` matrix each row is one transcript and each column is one sample.
+The number in each cell is how many reads mapped to that transcript in that sample (not normalized).
+
+---
+
+# Part 2: Exploring the Counts
+
+## **Library sizes**
+
+Let's check the library size for each sample:
+
+```{r library-sizes}
+library_sizes <- colSums(counts_raw)
+library_sizes
+
+library_sizes_tibble <- tibble(
+  sample      = names(library_sizes),
+  total_reads = library_sizes
+) %>%
+  left_join(
+    design %>% rownames_to_column("sample") %>% 
+      dplyr::select(sample, dex), 
+    by = "sample") %>%
+  rename(condition = dex)
+head(library_sizes_tibble)
+```
+
+Each sample has a different total number of mapped reads (library size).
+
+```{r library-size-plot}
+ggplot(library_sizes_tibble, aes(x = sample, y = total_reads, fill = condition)) +
+  geom_col() +
+  labs(title = "Library sizes per sample",
+       x     = "Sample",
+       y     = "Total mapped reads",
+       fill  = "Condition") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We see that the library sizes are different for each sample, so a normalization step is necessary before comparing the expression of the same gene across different samples.
+The normalized reads will be in CPM (counts per million).
+
+Also we count the genes with zero counts across all samples and remove those before analysis, because they carry no information and it is computationally more expensive and biologically not informative to deal with zero-count genes.
+
+```{r zero-counts}
+n_zero <- sum(rowSums(counts_raw) == 0)
+cat("Genes with zero counts across all samples:", n_zero, "\n")
+cat("Total genes:", nrow(counts_raw), "\n")
+```
+
+```{r filter-zeros}
+counts_filtered <- counts_raw[rowSums(counts_raw) > 0, ]
+cat("Genes remaining after filtering:", nrow(counts_filtered), "\n")
+```
+
+---
+
+# Part 3: Normalization CPM
+
+Raw counts cannot be compared directly between samples because of different library sizes.
+We normalize to **CPM** (Counts Per Million):
+
+$$CPM = \frac{\text{raw count}}{\text{library size}} \times 10^6$$
+
+This makes counts comparable across samples while keeping the relative differences between genes the same within a sample.
+
+```{r cpm}
+library_sizes_filtered <- colSums(counts_filtered)
+
+cpm <- sweep(counts_filtered, 2, library_sizes_filtered, FUN = "/") * 1e6
+
+# Check: each column should now sum to 1,000,000
+colSums(cpm)
+```
+
+`sweep()` applies an operation between a matrix and a vector, row by row or column by column.
+Breaking down the arguments:
+
+- `counts_filtered` — the matrix to operate on
+- `2` — apply along columns (1 would mean rows)
+- `library_sizes_filtered` — the vector to use in the operation
+- `FUN = "/"` — divide
+
+## Distribution of CPM values
+
+```{r cpm-distribution}
+log_cpm <- log2(cpm + 1)
+
+log_cpm %>%
+  as.data.frame() %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "log2_cpm") %>%
+  left_join(
+    design %>%
+      rownames_to_column("sample") %>%
+      dplyr::select(sample, dex),
+    by = "sample"
+  ) %>%
+  ggplot(aes(x = log2_cpm, colour = dex, group = sample)) +
+  geom_density(alpha = 0.4) +
+  labs(title  = "Distribution of log2(CPM + 1) per sample",
+       x      = "log2(CPM + 1)",
+       y      = "Density",
+       colour = "Sample") +
+  theme_minimal()
+```
+
+The CPM distribution is a quality control step to check if after normalization all samples have a similar distribution of expression values, so the normalization step worked.
+
+The density curves show a similar distribution shape across all samples — a large peak near zero (lowly expressed genes) and a broader shoulder of moderately to highly expressed genes. Treated and untreated samples overlap well, confirming there is no global systematic difference between conditions and that the data is suitable for differential expression analysis.
+
+---
+
+# Part 4: PCA and Clustering
+
+Before comparing conditions, we check whether the samples behave as expected.
+Check if treated samples cluster together and separately from untreated.
+
+## **PCA** (Principal Component Analysis)
+
+PCA reduces the ~60,000 gene dimensions down to a few components that capture the most variation in the data.
+We then plot the first two components (PC1, PC2) to see how samples relate to each other.
+
+```{r pca}
+pca_result <- prcomp(t(log_cpm))
+
+percent_variance <- summary(pca_result)$importance["Proportion of Variance", ] * 100
+percent_variance
+
+pca_plot <- as_tibble(pca_result$x, rownames = "sample") %>%
+  mutate(condition = design$dex,
+         cell_line = design$cell)
+
+ggplot(pca_plot, aes(x = PC1, y = PC2, colour = condition, label = sample, shape = cell_line)) +
+  geom_point() +
+  geom_text_repel() +
+  labs(x = paste0("PC1: ", round(percent_variance[1], 1), "%"),
+       y = paste0("PC2: ", round(percent_variance[2], 1), "%")) +
+  theme_minimal()
+```
+
+The samples are separated based on conditions across PC1.
+All 4 untreated samples are on the left, all 4 treated are on the right.
+This means the biggest source of variation in the data is the dexamethasone treatment, which is exactly what we want to see.
+PC1 captures `r round(percent_variance[1], 1)`% of the total variance.
+
+PC2 captures `r round(percent_variance[2], 1)`% of variance and reflects the cell line effect.
+SRR1039516 (untreated) and SRR1039517 (treated) are both high on PC2 compared to the other 6 samples — those two samples come from a different cell line.
+
+## **Hierarchical Clustering Dendrogram**
+
+A dendrogram groups samples by similarity.
+Samples that are closer together (shorter branch length) are more similar in their overall expression profile.
+
+```{r hclust}
+sample_dists <- dist(t(log_cpm), method = "euclidean")
+hc <- hclust(sample_dists, method = "average")
+
+plot(hc,
+     main = "Hierarchical clustering of samples",
+     xlab = "",
+     sub  = "",
+     ylab = "Euclidean distance")
+```
+
+The dendrogram shows two clearly separated branches.
+All four untreated samples cluster together on the left, and all four treated samples cluster together on the right.
+The height at which the two groups merge is greater than the height within each group, confirming that the treatment effect is the dominant source of variation.
+No outlier samples are detected.
+This result is consistent with the PCA and confirms the experiment is of good quality.
+
+---
+
+# Part 5: Differential Expression with DESeq2
+
+So far we have normalized our data and confirmed the quality.
+Now we do the actual analysis: finding genes that are **significantly differentially expressed** between treated and untreated samples.
+
+We use **DESeq2**, the standard tool for this.
+DESeq2 accounts for biological variability across replicates and computes proper statistics — a p-value and an adjusted p-value for every gene.
+
+## Set up the **DESeq2 object**
+
+```{r deseq2-setup}
+# DESeq2 works directly from the raw counts (NOT CPM — it does its own normalisation)
+
+# Model without cell line (for comparison)
+dds0 <- DESeqDataSetFromMatrix(
+  countData = counts_raw,
+  colData   = design,
+  design    = ~ dex
+)
+
+# Model with cell line (better — removes cell line noise)
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_raw,
+  colData   = design,
+  design    = ~ cell + dex
+)
+
+dds
+```
+
+## Run DESeq2
+
+```{r run-deseq2, cache=TRUE}
+dds0 <- DESeq(dds0)
+dds  <- DESeq(dds)
+```
+
+## Extract the results
+
+```{r extract-results}
+res0 <- results(dds0, contrast = c("dex", "trt", "untrt"), lfcThreshold = 0.25, alpha = 0.05)
+res  <- results(dds,  contrast = c("dex", "trt", "untrt"), lfcThreshold = 0.25, alpha = 0.05)
+
+summary(res0)
+summary(res)
+```
+
+```{r results-table}
+# Build the main results table from res (cell + dex model)
+results_table <- as.data.frame(res) %>%
+  rownames_to_column("gene_id") %>%
+  as_tibble()
+```
+
+The results table has these key columns:
+
+- **`log2FoldChange`** — how much the gene changed (positive = up in treated)
+- **`pvalue`** — raw p-value
+- **`padj`** — adjusted p-value (corrected for multiple testing across ~60k genes)
+
+Compared to the model without cell line (`~ dex` only), including the cell line in the design (`~ cell + dex`) increased the number of significant genes because it removes the cell line noise from the residuals, giving DESeq2 more statistical power.
+We use `padj` instead of `pvalue` because we are testing tens of thousands of genes simultaneously — DESeq2 corrects for multiple testing using the Benjamini-Hochberg method, which controls the false discovery rate (FDR).
+
+---
+
+# Part 6: Diagnostics
+
+Before looking at results, we check that DESeq2's statistical model fit the data correctly.
+These three plots are standard checks in any DESeq2 analysis.
+
+## **Dispersion plot**
+
+DESeq2 estimates the **dispersion** (variability) of each gene across samples.
+It first estimates a per-gene dispersion, then shrinks these estimates towards a fitted trend to improve reliability — especially for genes with low counts.
+
+```{r dispersion}
+plotDispEsts(dds)
+```
+
+The plot looks healthy.
+The red trend line decreases smoothly from left to right, confirming that low-expressed genes are more variable than highly expressed ones — a well-known property of RNA-seq count data.
+The blue (final) estimates cluster tightly around the trend, meaning DESeq2's shrinkage worked well.
+The model is appropriate for this data.
+
+## **P-value histogram**
+
+A histogram of raw p-values tells us whether the statistical test behaved correctly.
+
+```{r pval-histogram}
+# Use results without LFC threshold for this diagnostic
+
+# model with cell line
+res1 <- results(dds)
+
+results_table1 <- as.data.frame(res1) %>%
+  rownames_to_column("gene_id") %>%
+  as_tibble()
+
+# model without cell line
+results_table0 <- as.data.frame(results(dds0)) %>%
+  rownames_to_column("gene_id") %>%
+  as_tibble() %>%
+  mutate(model = "~ dex")
+
+results_table1 <- results_table1 %>%
+  mutate(model = "~ cell + dex")
+
+bind_rows(results_table0, results_table1) %>%
+  ggplot(aes(x = pvalue)) +
+  geom_histogram(binwidth = 0.05, fill = "hotpink", color = "black") +
+  facet_wrap(~ model) +
+  labs(title = "P-value distribution comparison",
+       x     = "Raw p-value",
+       y     = "Frequency") +
+  theme_minimal()
+```
+
+The spike near 0 is much taller compared to the model without cell line — including `cell` in the design removed noise and gave DESeq2 more power to detect true differences.
+The flat middle region (0.1–0.7) represents null genes, uniformly distributed as expected.
+The residual spike near 0.75–1.0 is caused by DESeq2's independent filtering: genes that barely pass the count threshold get very high p-values because they don't have enough counts for reliable testing.
+This is expected behaviour for this dataset and not a sign of a model problem.
+
+## **MA plot**
+
+DESeq2's built-in MA plot shows log2 fold change (y-axis) vs mean expression (x-axis).
+Points are coloured by significance.
+DESeq2 applies **fold change shrinkage** to reduce noise from low-count genes — their fold changes are pulled towards zero.
+
+```{r ma-plot}
+plotMA(res, ylim = c(-5, 5),
+       main = "MA plot: Treated vs Untreated")
+```
+
+The plot shows significant genes (blue) spread both above and below 0, confirming dexamethasone both activates and represses genes.
+The fan shape on the left is typical — low-count genes have noisier fold change estimates.
+At higher expression levels (right side), the fold changes tighten around 0 for non-significant genes, as expected.
+
+--- 
+
+# Part 7: Visualisation
+
+## **Volcano plot**
+
+A **volcano plot** shows statistical significance (−log10 adjusted p-value) on the y-axis and fold change on the x-axis.
+Genes that are both highly significant and strongly changed appear in the top corners.
+
+```{r volcano}
+results_table %>%
+  filter(!is.na(padj)) %>%
+  mutate(
+    direction = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "Up",
+      padj < 0.05 & log2FoldChange < -1 ~ "Down",
+      TRUE                               ~ "NS"
+    ),
+    label = ifelse(padj < 1e-10 & abs(log2FoldChange) > 2, gene_id, NA)
+  ) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj), colour = direction)) +
+  geom_point(alpha = 0.4, size = 0.8) +
+  geom_text_repel(aes(label = label), size = 3, colour = "black", max.overlaps = 15) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", colour = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "black") +
+  scale_colour_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "grey")) +
+  labs(title  = "Volcano plot: Treated vs Untreated",
+       x      = "log2 Fold Change",
+       y      = "-log10(adjusted p-value)",
+       colour = "Direction") +
+  theme_minimal()
+```
+
+## Top significant genes
+
+```{r top-up-genes}
+top_up <- results_table %>%
+  filter(padj < 0.05, log2FoldChange > 1) %>%
+  arrange(desc(log2FoldChange)) %>%
+  head(20)
+
+top_up %>%
+  ggplot(aes(x = reorder(gene_id, log2FoldChange), y = log2FoldChange)) +
+  geom_col(fill = "aquamarine3") +
+  coord_flip() +
+  labs(title = "Top 20 up-regulated genes (Treated vs Untreated)",
+       x     = "Gene",
+       y     = "log2 Fold Change") +
+  theme_minimal()
+```
+
+```{r top-down-genes}
+top_down <- results_table %>%
+  filter(padj < 0.05, log2FoldChange < -1) %>%
+  arrange(log2FoldChange) %>%
+  head(20)
+
+top_down %>%
+  ggplot(aes(x = reorder(gene_id, abs(log2FoldChange)), y = abs(log2FoldChange))) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 20 down-regulated genes (Treated vs Untreated)",
+       x     = "Gene",
+       y     = "|log2 Fold Change|") +
+  theme_minimal()
+```
+
+
+---
+
+# Part 8: GO Term Enrichment Analysis
+
+Instead of looking up individual genes, we can ask a bigger question: **which biological processes are enriched among our differentially expressed genes?**
+
+GO (Gene Ontology) enrichment analysis tests whether genes from specific biological processes appear more often in our DE gene list than expected by chance.
+We use the `clusterProfiler` package.
+
+## Run GO enrichment on up-regulated genes
+
+```{r go-up, cache=TRUE}
+sig_up <- results_table %>%
+  filter(padj < 0.05, log2FoldChange > 0.25) %>%
+  pull(gene_id)
+
+ego_up <- enrichGO(
+  gene          = sig_up,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+head(as.data.frame(ego_up)[, c("Description", "GeneRatio", "pvalue", "p.adjust")])
+```
+
+## Visualise — dotplot
+
+```{r go-up-plot}
+dotplot(ego_up, showCategory = 15,
+        title = "GO Biological Processes — Up-regulated genes",
+        font.size = 8)
+```
+
+The top enriched GO terms make strong biological sense for dexamethasone.
+
+**Response to peptide hormone** and **cellular response to peptide hormone stimulus** reflect that dexamethasone acts as a steroid hormone, triggering hormone response pathways.
+
+**Cell-substrate adhesion** and **regulation of actin cytoskeleton** are consistent with glucocorticoids remodelling the cytoskeleton and altering cell attachment.
+
+**Response to oxidative stress** reflects dexamethasone's antioxidant properties.
+
+**Response to insulin** also appears — glucocorticoids are known to interfere with insulin signalling, which explains why long-term steroid use can cause diabetes.
+
+## Run GO enrichment on down-regulated genes
+
+```{r go-down, cache=TRUE}
+sig_down <- results_table %>%
+  filter(padj < 0.05, log2FoldChange < -0.25) %>%
+  pull(gene_id)
+
+ego_down <- enrichGO(
+  gene          = sig_down,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENSEMBL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+head(as.data.frame(ego_down)[, c("Description", "GeneRatio", "pvalue", "p.adjust")])
+
+dotplot(ego_down, showCategory = 15,
+        title = "GO Biological Processes — Down-regulated genes",
+        font.size = 8)
+```
+
+The down-regulated terms are more surprising at first glance — **axonogenesis**, **axon guidance**, **neuron projection guidance**, and **positive regulation of nervous system development** suggest that dexamethasone suppresses neuronal-related gene programmes.
+
+This is consistent with known glucocorticoid effects on the nervous system: long-term steroid use can affect neurodevelopment and neural plasticity.
+
+**Monocyte differentiation** and **regulation of monocyte differentiation** are particularly relevant — dexamethasone is an anti-inflammatory drug and suppressing monocyte (immune cell) differentiation is one of its key mechanisms of action.
+
+**DNA damage response via p53** being down-regulated is also notable, as glucocorticoids can modulate p53 activity.
+
+## Fisher's exact test on the top GO term
+
+The dotplot shows enrichment visually, but we can also test it statistically with a **Fisher's exact test**. We focus on the most enriched GO term: **response to peptide hormone (GO:0043434)**.
+
+**What are we testing?**
+We want to know whether genes annotated to this GO term appear among our differentially expressed genes more often than expected by chance.
+
+**Null hypothesis (H₀):** Being differentially expressed and belonging to the GO term "response to peptide hormone" are **independent**. In other words, knowing a gene is in this GO term tells you nothing about whether it is DE.
+
+**Alternative hypothesis (H₁):** DE genes are **enriched** for this GO term — they belong to it at a higher rate than non-DE genes.
+
+We use Fisher's exact test rather than chi-square because some cell counts are small — Fisher's does not rely on a large-sample approximation and is the standard choice in this situation. It is also what `enrichGO()` uses internally.
+
+We build a 2×2 contingency table for every gene tested:
+
+|  | In GO term | Not in GO term |
+|--|--|--|
+| **DE** | a | b |
+| **Not DE** | c | d |
+
+If H₀ is true, the proportion a/(a+b) should equal c/(c+d).
+
+```{r go-chisq}
+go_genes <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys    = "GO:0043434",
+  columns = "ENSEMBL",
+  keytype = "GO"
+)$ENSEMBL
+
+results_annotated <- results_table %>%
+  filter(!is.na(padj)) %>%
+  mutate(
+    is_de = padj < 0.05 & abs(log2FoldChange) > 0.25,
+    in_go = gene_id %in% go_genes
+  )
+
+cont_table <- table(
+  DE    = results_annotated$is_de,
+  In_GO = results_annotated$in_go
+)
+
+print(cont_table)
+```
+
+```{r fisher-test}
+fisher_result <- fisher.test(cont_table)
+fisher_result
+```
+
+```{r fisher-interpret}
+prop_de     <- cont_table["TRUE",  "TRUE"] / sum(cont_table["TRUE",  ])
+prop_non_de <- cont_table["FALSE", "TRUE"] / sum(cont_table["FALSE", ])
+
+cat("Proportion of DE genes in GO term:     ", round(prop_de, 4), "\n")
+cat("Proportion of non-DE genes in GO term: ", round(prop_non_de, 4), "\n")
+```
+
+The contingency table shows `r cont_table["TRUE", "TRUE"]` DE genes and `r cont_table["FALSE", "TRUE"]` non-DE genes belonging to this GO term.
+
+Fisher's exact test gives **p-value = `r round(fisher_result$p.value, 3)`** and **odds ratio = `r round(fisher_result$estimate, 2)`**.
+
+Since p < 0.05 we reject H₀ — DE genes and GO term membership are not independent.
+
+DE genes are **`r round(fisher_result$estimate, 2)`× more likely** to be annotated to "response to peptide hormone" than non-DE genes.
+
+However, the 95% confidence interval just crosses 1, indicating the result is borderline significant. The small number of genes in this GO term limits statistical power, and the result should be interpreted as supporting rather than confirming the enrichment already identified by `enrichGO()`.
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
